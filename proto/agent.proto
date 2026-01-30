@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package agent;
+
+option go_package = "neuro-grid/pb";
+
+// NeuroService: 神经中枢服务
+// 类似于游戏里的 "WorldServer"，负责分发指令和接收状态
+service NeuroService {
+  // 1. Handshake: Worker 节点启动时向 Center 注册 (就像 NPC 上线)
+  rpc RegisterWorker (WorkerInfo) returns (RegisterResponse);
+
+  // 2. Heartbeat: 维持 TCP 长连接保活 (Keep-Alive)
+  rpc Heartbeat (Ping) returns (Pong);
+
+  // 3. TaskExecution: 核心指令通道
+  // Server 下发 Prompt，Worker以此流式返回 Token (Server-side Streaming)
+  rpc ExecuteTask (TaskRequest) returns (stream TaskResponse);
+  rpc WorkerStream (stream WorkerData) returns (stream ServerCommand);
+}
+
+message WorkerData {
+  oneof payload {
+    Ping ping = 1;
+    TaskResponse result = 2; // 推理结果
+  }
+}
+
+message ServerCommand {
+  oneof payload {
+    Pong pong = 1;
+    TaskRequest task = 2; // 下发任务
+  }
+}
+
+message WorkerInfo {
+  string worker_id = 1;      // UUID
+  string gpu_model = 2;      // e.g., "RTX 4070 Ti Super"
+  int32 vram_total_mb = 3;   // 显存大小，用于调度权重计算
+  repeated string capabilities = 4; // 支持的模型 ["llama3", "mistral"]
+}
+
+message RegisterResponse {
+  bool success = 1;
+  string server_time = 2;
+}
+
+message Ping { string worker_id = 1; }
+message Pong { bool ack = 1; }
+
+message TaskRequest {
+  string request_id = 1;     // TraceID
+  string model_name = 2;     // 指定模型
+  string prompt = 3;         // 原始 Prompt
+  float temperature = 4;     // 随机性参数
+}
+
+message TaskResponse {
+  string request_id = 1;
+  string content = 2;        // 生成的 Token (或者 Error Message)
+  bool is_final = 3;         // 是否结束 (End of Stream)
+
+  // 性能遥测数据 (类似游戏里的 FPS/Ping)
+  map<string, string> metrics = 4; // e.g., {"tps": "45.2", "latency": "20ms"}
+}
