@@ -1,110 +1,136 @@
 package server
 
 import (
-	"errors"
 	"fmt"
+	"io"
 	"log"
 	"sync"
-	"time"
 
 	"github.com/leon37/neuro-grid/pb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-// Task 代表一个具体的推理任务
+// Task 结构体：在内部传递的任务包
 type Task struct {
 	ID         string
 	Prompt     string
-	ResultChan chan string // 用于把结果传回给调用者 (User)
+	ResultChan chan<- string // 只写通道
 }
 
-// WorkerNode 扩展之前的 WorkerState
+// WorkerNode: 现在的 Worker 是一个有状态的管道
 type WorkerNode struct {
 	ID          string
-	CommandChan chan *Task // Server -> Worker 的指令通道
+	Stream      pb.NeuroService_WorkerStreamServer // 原始 gRPC 流句柄
+	CommandChan chan *pb.ServerCommand             // 发送队列
+	Quit        chan struct{}
 }
 
 type NeuroServer struct {
 	pb.UnimplementedNeuroServiceServer
 
-	mu      sync.RWMutex
-	workers map[string]*WorkerNode
-
-	// 全局任务队列 (缓冲 1000 个请求)
+	mu        sync.RWMutex
+	workers   map[string]*WorkerNode
 	taskQueue chan *Task
-
-	// 信号量：用于优雅退出
-	quit chan struct{}
 }
 
 func NewNeuroServer() *NeuroServer {
-	s := &NeuroServer{
+	return &NeuroServer{
 		workers:   make(map[string]*WorkerNode),
-		taskQueue: make(chan *Task, 1000), // Backpressure Buffer
-		quit:      make(chan struct{}),
+		taskQueue: make(chan *Task, 1000), // Buffer
 	}
-
-	// 启动调度主循环 (The Game Loop)
-	go s.scheduleLoop()
-	return s
 }
 
-// 核心调度循环：相当于游戏里的 Update() / Tick()
-func (s *NeuroServer) scheduleLoop() {
-	log.Println("[Scheduler] Logic loop started...")
+// 核心接口: WorkerStream
+// 这是一个长连接，直到 Worker 断开前都不会 return
+func (s *NeuroServer) WorkerStream(stream pb.NeuroService_WorkerStreamServer) error {
+	// 1. 握手阶段 (Handshake)
+	// 强制 Worker 发送的第一条消息必须是 Ping (含 ID)
+	firstMsg, err := stream.Recv()
+	if err != nil {
+		return err
+	}
 
+	workerID := ""
+	// 解析 Oneof 字段
+	switch payload := firstMsg.Payload.(type) {
+	case *pb.WorkerData_Ping:
+		workerID = payload.Ping.WorkerId
+	default:
+		return status.Errorf(codes.Unauthenticated, "First message must be Ping")
+	}
+
+	log.Printf("[Synapse] Worker %s connected via Neural Link.", workerID)
+
+	// 2. 注册节点 (Register)
+	node := &WorkerNode{
+		ID:          workerID,
+		Stream:      stream,
+		CommandChan: make(chan *pb.ServerCommand, 100),
+		Quit:        make(chan struct{}),
+	}
+
+	s.mu.Lock()
+	s.workers[workerID] = node
+	s.mu.Unlock()
+
+	// 3. 启动发送协程 (The Sender)
+	// 专门负责把 CommandChan 里的东西写进 gRPC Stream
+	go s.handleSendLoop(node)
+
+	// 4. 清理闭包 (Cleanup)
+	defer func() {
+		s.mu.Lock()
+		delete(s.workers, workerID)
+		s.mu.Unlock()
+		close(node.Quit) // 通知发送协程退出
+		log.Printf("[Disconnect] Worker %s lost signal.", workerID)
+	}()
+
+	// 5. 接收主循环 (The Receiver)
+	// 阻塞在这里，直到连接断开
 	for {
-		select {
-		case task := <-s.taskQueue:
-			// 1. 收到任务，寻找空闲 Worker
-			worker := s.pickIdleWorker()
+		msg, err := stream.Recv()
+		if err == io.EOF {
+			return nil // 正常关闭
+		}
+		if err != nil {
+			return err // 异常断开
+		}
 
-			if worker != nil {
-				// 2. 派发任务 (非阻塞，防止 Worker 假死拖累 Server)
-				select {
-				case worker.CommandChan <- task:
-					log.Printf("[Dispatch] Task %s -> Worker %s", task.ID, worker.ID)
-				default:
-					log.Printf("[Drop] Worker %s buffer full, task %s dropped", worker.ID, task.ID)
-					// 生产环境这里应该重新入队 (Re-queue)
-				}
-			} else {
-				// 3. 无可用 Worker，暂时丢弃或排队
-				// 简单起见，这里直接报错 (或者你可以实现一个 WaitingQueue)
-				log.Printf("[Overflow] No idle workers for task %s", task.ID)
-				// 通知用户失败
-				close(task.ResultChan)
+		// 处理接收到的数据
+		switch payload := msg.Payload.(type) {
+		case *pb.WorkerData_Ping:
+			// 处理心跳，这里简单回复一个 Pong
+			select {
+			case node.CommandChan <- &pb.ServerCommand{
+				Payload: &pb.ServerCommand_Pong{Pong: &pb.Pong{Ack: true}},
+			}:
+			default:
+				log.Println("Worker send buffer full, dropping pong")
 			}
 
-		case <-s.quit:
-			return
+		case *pb.WorkerData_Result:
+			// 收到 LLM 生成的 Token！
+			// 这里是未来对接 TUI (界面) 的地方
+			// TODO: 将 Token 路由回原始请求者
+			res := payload.Result
+			fmt.Printf("\r[%s]: %s", res.RequestId, res.Content) // 简单打印
 		}
 	}
 }
 
-// pickIdleWorker: 简单的负载均衡策略 (Random or First-Available)
-func (s *NeuroServer) pickIdleWorker() *WorkerNode {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	// 简单轮询：找到第一个存在的 Worker (实际场景应该配合 Status 字段)
-	for _, w := range s.workers {
-		return w
-	}
-	return nil
-}
-
-// SubmitTask: 供外部 (gRPC Handler) 调用
-func (s *NeuroServer) SubmitTask(prompt string) (<-chan string, error) {
-	resultChan := make(chan string, 10) // 缓冲 Token 流
-
-	select {
-	case s.taskQueue <- &Task{
-		ID:         fmt.Sprintf("req-%d", time.Now().UnixNano()),
-		Prompt:     prompt,
-		ResultChan: resultChan,
-	}:
-		return resultChan, nil
-	default:
-		return nil, errors.New("system overloaded")
+// 发送循环：将 Go Channel 转换为 gRPC Send
+func (s *NeuroServer) handleSendLoop(node *WorkerNode) {
+	for {
+		select {
+		case cmd := <-node.CommandChan:
+			if err := node.Stream.Send(cmd); err != nil {
+				log.Printf("Failed to send to worker %s: %v", node.ID, err)
+				return // 发送失败通常意味着连接断了
+			}
+		case <-node.Quit:
+			return // 主接收循环退出了，我也撤
+		}
 	}
 }
